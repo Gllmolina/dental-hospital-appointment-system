@@ -1,0 +1,18 @@
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:mysql://127.0.0.1:3306/dental_hospital?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC}
+    username: ${DB_USER:root}
+    password: ${DB_PASSWORD:}
+  flyway:
+    enabled: true
+  jackson:
+    time-zone: Asia/Shanghai
+server:
+  servlet:
+    context-path: /
+booking:
+  window-days: 7
+  daily-limit: 3
+  hold-minutes: 15
+  cancel-before-minutes: 120
+  check-in-early-minutes: 30
