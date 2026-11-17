@@ -13,7 +13,12 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
 import java.math.BigDecimal;
+import java.awt.image.BufferedImage;
+import javax.imageio.ImageIO;
+import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
@@ -22,12 +27,15 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.util.LinkedMultiValueMap;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 @EnabledIfEnvironmentVariable(named = "RUN_DB_TESTS", matches = "true")
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class ConcurrencyAcceptanceTest {
+    private static final Path VERIFICATION_OUTBOX = Path.of(System.getProperty("user.home"), ".dental-test-outbox-" + UUID.randomUUID());
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry r) {
         r.add("spring.datasource.url", () -> System.getenv().getOrDefault("TEST_DB_URL", "jdbc:mysql://127.0.0.1:3306/dental_hospital_test?serverTimezone=UTC"));
@@ -37,6 +45,9 @@ class ConcurrencyAcceptanceTest {
         r.add("ADMIN_USERNAME", () -> "test_admin");
         r.add("ADMIN_PHONE", () -> "13999999999");
         r.add("ADMIN_PASSWORD", () -> "TestAdminPassword123!");
+        r.add("VERIFICATION_DELIVERY_MODE", () -> "local-file");
+        r.add("VERIFICATION_SECRET", () -> "test-verification-secret-with-at-least-32-bytes");
+        r.add("VERIFICATION_OUTBOX_DIR", () -> VERIFICATION_OUTBOX.toString());
     }
 
     @Autowired
@@ -89,6 +100,23 @@ class ConcurrencyAcceptanceTest {
 
     private long count(String sql, Object... args) {
         return Objects.requireNonNull(db.queryForObject(sql, Long.class, args));
+    }
+
+    private String latestCode(String purpose, String destination) throws Exception {
+        try (var files = Files.list(VERIFICATION_OUTBOX)) {
+            Path file = files.filter(Files::isRegularFile)
+                    .filter(path -> {
+                        try {
+                            String content = Files.readString(path);
+                            return content.contains("purpose=" + purpose + "\n") && content.contains("destination=" + destination + "\n");
+                        } catch (Exception error) { return false; }
+                    })
+                    .max(Comparator.comparingLong(path -> {
+                        try { return Files.getLastModifiedTime(path).toMillis(); }
+                        catch (Exception error) { return 0; }
+                    })).orElseThrow();
+            return Files.readAllLines(file).stream().filter(line -> line.startsWith("code=")).findFirst().orElseThrow().substring(5);
+        }
     }
 
     private User user(String role, long department) {
@@ -758,5 +786,161 @@ class ConcurrencyAcceptanceTest {
                 Map.of("value", 7, "version", version, "reason", "保持默认值")).getStatusCodeValue());
         assertEquals(409, http("PUT", "/admin/settings/booking.windowDays", admin.token, null,
                 Map.of("value", 7, "version", version, "reason", "过期版本")).getStatusCodeValue());
+    }
+
+    @Test
+    void passwordResetUsesPrivateOutboxAndSingleUseCode() throws Exception {
+        User patient = user("PATIENT", 0);
+        String username = db.queryForObject("SELECT username FROM sys_user WHERE id=?", String.class, patient.userId);
+        String phone = db.queryForObject("SELECT phone FROM sys_user WHERE id=?", String.class, patient.userId);
+        String accepted = String.valueOf(http("POST", "/auth/password-reset/request", patient.token, null,
+                Map.of("identifier", username)).getBody().get("message"));
+        assertEquals(accepted, http("POST", "/auth/password-reset/request", patient.token, null,
+                Map.of("identifier", unique("missing"))).getBody().get("message"));
+        String code = latestCode("PASSWORD_RESET", phone);
+        String digest = db.queryForObject("SELECT code_digest FROM verification_challenge WHERE user_id=? ORDER BY id DESC LIMIT 1", String.class, patient.userId);
+        assertNotEquals(code, digest);
+        String wrong = code.equals("00000000") ? "00000001" : "00000000";
+        assertEquals(400, http("POST", "/auth/password-reset/confirm", patient.token, null,
+                Map.of("identifier", username, "code", wrong, "newPassword", "NewPassword123!")).getStatusCodeValue());
+        assertEquals(1, count("SELECT attempt_count FROM verification_challenge WHERE user_id=? ORDER BY id DESC LIMIT 1", patient.userId));
+        assertEquals(200, http("POST", "/auth/password-reset/confirm", patient.token, null,
+                Map.of("identifier", username, "code", code, "newPassword", "NewPassword123!")).getStatusCodeValue());
+        assertEquals(400, http("POST", "/auth/password-reset/confirm", patient.token, null,
+                Map.of("identifier", username, "code", code, "newPassword", "AgainPassword123!")).getStatusCodeValue());
+        assertEquals(401, http("GET", "/auth/me", patient.token, null, null).getStatusCodeValue());
+        assertEquals(200, http("POST", "/auth/login", patient.token, null,
+                Map.of("identifier", username, "password", "NewPassword123!")).getStatusCodeValue());
+    }
+
+    @Test
+    void passwordResetLocksAfterFiveWrongCodes() throws Exception {
+        User patient = user("PATIENT", 0);
+        String username = db.queryForObject("SELECT username FROM sys_user WHERE id=?", String.class, patient.userId);
+        String phone = db.queryForObject("SELECT phone FROM sys_user WHERE id=?", String.class, patient.userId);
+        assertEquals(200, http("POST", "/auth/password-reset/request", null, null, Map.of("identifier", username)).getStatusCodeValue());
+        String valid = latestCode("PASSWORD_RESET", phone);
+        String invalid = valid.equals("00000000") ? "00000001" : "00000000";
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            assertEquals(400, http("POST", "/auth/password-reset/confirm", null, null,
+                    Map.of("identifier", username, "code", invalid, "newPassword", "ChangedPassword123!")).getStatusCodeValue());
+            assertEquals(attempt, count("SELECT attempt_count FROM verification_challenge WHERE user_id=? ORDER BY id DESC LIMIT 1", patient.userId));
+        }
+        assertEquals(400, http("POST", "/auth/password-reset/confirm", null, null,
+                Map.of("identifier", username, "code", valid, "newPassword", "ChangedPassword123!")).getStatusCodeValue());
+        assertEquals(200, http("POST", "/auth/login", null, null,
+                Map.of("identifier", username, "password", "Password123!")).getStatusCodeValue());
+    }
+
+    @Test
+    void phoneChangeRequiresCodeAndCurrentPassword() throws Exception {
+        User patient = user("PATIENT", 0), other = user("PATIENT", 0);
+        String newPhone = "139" + String.format("%08d", PHONE.incrementAndGet());
+        assertEquals(200, http("POST", "/patient/phone-change/request", patient.token, null,
+                Map.of("newPhone", newPhone)).getStatusCodeValue());
+        String code = latestCode("PHONE_CHANGE", newPhone);
+        assertEquals(400, http("POST", "/patient/phone-change/confirm", other.token, null,
+                Map.of("newPhone", newPhone, "code", code, "currentPassword", "Password123!")).getStatusCodeValue());
+        assertEquals(400, http("POST", "/patient/phone-change/confirm", patient.token, null,
+                Map.of("newPhone", newPhone, "code", code, "currentPassword", "wrong-password")).getStatusCodeValue());
+        assertEquals(200, http("POST", "/patient/phone-change/confirm", patient.token, null,
+                Map.of("newPhone", newPhone, "code", code, "currentPassword", "Password123!")).getStatusCodeValue());
+        assertEquals(newPhone, db.queryForObject("SELECT phone FROM sys_user WHERE id=?", String.class, patient.userId));
+        assertEquals(401, http("GET", "/auth/me", patient.token, null, null).getStatusCodeValue());
+    }
+
+    @Test
+    void avatarUploadChecksImageAndOwnership() throws Exception {
+        User owner = user("PATIENT", 0), other = user("PATIENT", 0);
+        BufferedImage image = new BufferedImage(64, 64, BufferedImage.TYPE_INT_RGB);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        assertTrue(ImageIO.write(image, "png", bytes));
+        HttpHeaders headers = new HttpHeaders(); headers.setBearerAuth(owner.token); headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+        var parts = new LinkedMultiValueMap<String, Object>();
+        parts.add("file", new ByteArrayResource(bytes.toByteArray()) { @Override public String getFilename() { return "avatar.png"; } });
+        ResponseEntity<Map> uploaded = rest.exchange(base() + "/patient/avatar", HttpMethod.POST, new HttpEntity<>(parts, headers), Map.class);
+        assertEquals(200, uploaded.getStatusCodeValue(), String.valueOf(uploaded.getBody()));
+        HttpHeaders own = new HttpHeaders(); own.setBearerAuth(owner.token);
+        HttpHeaders stranger = new HttpHeaders(); stranger.setBearerAuth(other.token);
+        ResponseEntity<byte[]> result = rest.exchange(base() + "/patient/avatar", HttpMethod.GET, new HttpEntity<>(own), byte[].class);
+        assertEquals(200, result.getStatusCodeValue());
+        assertEquals(MediaType.IMAGE_JPEG, result.getHeaders().getContentType());
+        assertEquals(404, rest.exchange(base() + "/patient/avatar", HttpMethod.GET, new HttpEntity<>(stranger), byte[].class).getStatusCodeValue());
+        parts.set("file", new ByteArrayResource("not an image".getBytes(StandardCharsets.UTF_8)) { @Override public String getFilename() { return "fake.png"; } });
+        assertEquals(400, rest.exchange(base() + "/patient/avatar", HttpMethod.POST, new HttpEntity<>(parts, headers), Map.class).getStatusCodeValue());
+        ByteArrayOutputStream webp = new ByteArrayOutputStream();
+        assertTrue(ImageIO.write(image, "webp", webp));
+        parts.set("file", new ByteArrayResource(webp.toByteArray()) { @Override public String getFilename() { return "avatar.webp"; } });
+        assertEquals(200, rest.exchange(base() + "/patient/avatar", HttpMethod.POST, new HttpEntity<>(parts, headers), Map.class).getStatusCodeValue());
+    }
+
+    @Test
+    void listFiltersKeepOwnersAndBookingWindow() {
+        Fixture f = fixture(1, future());
+        User owner = user("PATIENT", 0), other = user("PATIENT", 0), doctor = userForDoctor(f.doctorId);
+        LocalDate day = f.start.atZone(ZoneOffset.UTC).withZoneSameInstant(ZONE).toLocalDate();
+        assertEquals(1, ((List<?>) http("GET", "/doctors?departmentId=" + f.departmentId + "&visitDate=" + day, null, null, null).getBody().get("items")).size());
+        ResponseEntity<Map> booked = http("POST", "/appointments", owner.token, UUID.randomUUID().toString(), Map.of("slotId", Long.toString(f.slotId)));
+        long id = appointmentId(booked);
+        assertTrue(((List<?>) http("GET", "/doctors?departmentId=" + f.departmentId + "&visitDate=" + day, null, null, null).getBody().get("items")).isEmpty());
+        assertEquals(400, http("GET", "/doctors/" + f.doctorId + "/slots?from=" + day.plusDays(9), null, null, null).getStatusCodeValue());
+        assertEquals(1, ((List<?>) http("GET", "/patient/appointments?status=PENDING_PAYMENT&from=" + day + "&to=" + day, owner.token, null, null).getBody().get("items")).size());
+        assertTrue(((List<?>) http("GET", "/patient/appointments?status=PENDING_PAYMENT&from=" + day + "&to=" + day, other.token, null, null).getBody().get("items")).isEmpty());
+        assertEquals(1, ((List<?>) http("GET", "/patient/bills?status=UNPAID&type=REGISTRATION", owner.token, null, null).getBody().get("items")).size());
+        assertTrue(((List<?>) http("GET", "/patient/bills?status=UNPAID&type=REGISTRATION", other.token, null, null).getBody().get("items")).isEmpty());
+        List<Map> doctorRows = (List<Map>) http("GET", "/doctor/appointments?from=" + day + "&to=" + day + "&status=PENDING_PAYMENT&keyword=虚构患者", doctor.token, null, null).getBody().get("items");
+        assertTrue(doctorRows.stream().anyMatch(row -> ((Number) row.get("id")).longValue() == id));
+    }
+
+    private long reportAppointment(Fixture base, LocalDateTime start, String status, boolean suspended, User patient) {
+        LocalDate day = start.atZone(ZoneOffset.UTC).withZoneSameInstant(ZONE).toLocalDate();
+        long schedule = insert("INSERT INTO schedule(doctor_id,department_id,room_id,visit_date,starts_at,ends_at,status,fee,capacity) VALUES(?,?,?,?,?,?,?,?,1)",
+                base.doctorId, base.departmentId, base.roomId, day, start, start.plusMinutes(30), suspended ? "SUSPENDED" : "PUBLISHED", new BigDecimal("30.00"));
+        long slot = insert("INSERT INTO schedule_slot(schedule_id,starts_at,ends_at,capacity,remaining,fee) VALUES(?,?,?,1,0,?)",
+                schedule, start, start.plusMinutes(30), new BigDecimal("30.00"));
+        return insert("INSERT INTO appointment(appointment_no,patient_id,doctor_id,department_id,slot_id,visit_date,starts_at,ends_at,status,registration_fee,pay_expires_at,cancel_deadline_at,check_in_opens_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,30,?,?,?,?)",
+                unique("AP"), patient.profileId, base.doctorId, base.departmentId, slot, day, start, start.plusMinutes(30), status,
+                start.minusHours(1), start.minusHours(2), start.minusMinutes(30), "COMPLETED".equals(status) ? start.plusMinutes(20) : null);
+    }
+
+    @Test
+    void t14FixedDataReconcilesCancellationNoShowRescheduleAndSuspension() {
+        LocalDate day = LocalDate.of(2026, 10, 1);
+        LocalDateTime first = day.atTime(1, 0);
+        Fixture base = fixture(1, first);
+        User patient = user("PATIENT", 0), admin = user("ADMIN", 0);
+        reportAppointment(base, first, "COMPLETED", false, patient);
+        reportAppointment(base, first.plusHours(1), "NO_SHOW", false, patient);
+        reportAppointment(base, first.plusHours(2), "CANCELLED", false, patient);
+        long moved = reportAppointment(base, first.plusHours(3), "BOOKED", false, patient);
+        db.update("INSERT INTO appointment_status_log(appointment_id,event_type,from_status,to_status,operator_id,reason) VALUES(?,'RESCHEDULE','BOOKED','BOOKED',?,'固定数据改约')", moved, patient.userId);
+        reportAppointment(base, first.plusHours(4), "CANCELLED", true, patient);
+        reportAppointment(base, first.plusDays(1), "COMPLETED", false, patient);
+        String path = "/admin/statistics/overview?from=" + day + "&to=" + day + "&departmentId=" + base.departmentId;
+        Map body = http("GET", path, admin.token, null, null).getBody();
+        Map counts = (Map) body.get("counts"), cancel = (Map) body.get("cancellationRate"), noShow = (Map) body.get("noShowRate"), occupied = (Map) body.get("utilization");
+        assertEquals(5, ((Number) counts.get("total")).intValue());
+        assertEquals(1, ((Number) counts.get("completed")).intValue());
+        assertEquals(2, ((Number) cancel.get("numerator")).intValue());
+        assertEquals(5, ((Number) cancel.get("denominator")).intValue());
+        assertEquals(0.4, ((Number) cancel.get("value")).doubleValue());
+        assertEquals(1, ((Number) noShow.get("numerator")).intValue());
+        assertEquals(2, ((Number) noShow.get("denominator")).intValue());
+        assertEquals(0.5, ((Number) noShow.get("value")).doubleValue());
+        assertEquals(3, ((Number) occupied.get("numerator")).intValue());
+        assertEquals(5, ((Number) occupied.get("denominator")).intValue());
+        assertEquals(0.6, ((Number) occupied.get("value")).doubleValue());
+        assertEquals(1, ((List<?>) body.get("trends")).size());
+        assertNotNull(body.get("asOf"));
+        assertEquals(1, ((List<?>) body.get("departmentDistribution")).size());
+        Map workload = ((List<Map>) body.get("doctorWorkload")).stream()
+                .filter(row -> ((Number) row.get("doctor_id")).longValue() == base.doctorId).findFirst().orElseThrow();
+        assertEquals(1, ((Number) workload.get("completed")).intValue());
+        assertEquals(150, ((Number) workload.get("published_minutes")).intValue());
+        Map nextDay = http("GET", "/admin/statistics/overview?from=" + day.plusDays(1) + "&to=" + day.plusDays(1) + "&departmentId=" + base.departmentId,
+                admin.token, null, null).getBody();
+        assertEquals(1, ((Number) ((Map) nextDay.get("counts")).get("total")).intValue());
+        assertEquals(400, http("GET", "/admin/statistics/overview?from=" + day.plusDays(1) + "&to=" + day, admin.token, null, null).getStatusCodeValue());
+        assertEquals(403, http("GET", path, patient.token, null, null).getStatusCodeValue());
     }
 }

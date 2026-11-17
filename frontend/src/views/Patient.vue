@@ -9,13 +9,19 @@ const tab = ref('booking'), message = ref(''), failed = ref(false), busy = ref(f
 const departments = ref([]), doctors = ref([]), slots = ref([]), appointments = ref([]), bills = ref([]),
     records = ref([])
 const departmentId = ref(''), doctorId = ref(''), selectedSlot = ref(null), symptom = ref('')
+const doctorKeyword = ref(''), doctorTitle = ref(''), visitDate = ref('')
 let bookingKey = ''
 const messages = ref([]), rescheduleId = ref(null)
 
 async function refresh() {
   try {
     const [d, doctorsResult, a, b, r, m] = await Promise.all([
-      api.get('/departments'), api.get('/doctors', {params: departmentId.value ? {departmentId: departmentId.value} : {}}),
+      api.get('/departments'), api.get('/doctors', {params: {
+        ...(departmentId.value ? {departmentId: departmentId.value} : {}),
+        ...(doctorKeyword.value ? {keyword: doctorKeyword.value} : {}),
+        ...(doctorTitle.value ? {title: doctorTitle.value} : {}),
+        ...(visitDate.value ? {visitDate: visitDate.value} : {})
+      }}),
       api.get('/patient/appointments'), api.get('/patient/bills'), api.get('/patient/medical-records'), api.get('/patient/messages')
     ]);
     departments.value = d.items;
@@ -40,7 +46,7 @@ async function loadDoctors() {
 
 async function loadSlots(id) {
   doctorId.value = id;
-  const r = await api.get(`/doctors/${id}/slots`);
+  const r = await api.get(`/doctors/${id}/slots`, {params: visitDate.value ? {from: visitDate.value, to: visitDate.value} : {}});
   slots.value = r.items;
   selectedSlot.value = null
 }
@@ -106,6 +112,12 @@ onMounted(refresh)
         <option value="">全部科室</option>
         <option v-for="d in departments" :key="d.id" :value="d.id">{{ d.name }}</option>
       </select>
+        <form @submit.prevent="loadDoctors">
+          <label for="doctor-keyword">医生姓名或擅长方向</label><input id="doctor-keyword" v-model.trim="doctorKeyword" maxlength="50">
+          <label for="doctor-title">职称</label><input id="doctor-title" v-model.trim="doctorTitle" maxlength="60">
+          <label for="visit-date">就诊日期</label><input id="visit-date" v-model="visitDate" type="date">
+          <button type="submit" class="quiet">筛选医生</button>
+        </form>
         <div class="grid">
           <div v-for="d in doctors" :key="d.id" class="panel doctor-card"><h3>{{ d.name }}</h3>
             <p>{{ d.department_name }} · {{ d.title }}</p>

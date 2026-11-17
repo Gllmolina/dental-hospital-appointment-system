@@ -1,5 +1,5 @@
 <script setup>
-import {onMounted, reactive, ref} from 'vue'
+import {onMounted, onUnmounted, reactive, ref} from 'vue'
 import {api, key} from '../api.js'
 import LeaveRequests from './LeaveRequests.vue'
 
@@ -8,6 +8,22 @@ const appointments = ref([]), catalog = ref([]), reviews = ref([]), selected = r
 const reply = ref({})
 const appealReason = ref({})
 const profile = reactive({specialty: '', intro: ''}), context = ref(null)
+const avatarUrl = ref('')
+async function loadAvatar() {
+  const blob = await api.get('/doctor/avatar', {responseType: 'blob'})
+  if (avatarUrl.value) URL.revokeObjectURL(avatarUrl.value)
+  avatarUrl.value = URL.createObjectURL(blob)
+}
+async function uploadAvatar(event) {
+  const file = event.target.files?.[0]
+  if (!file) return
+  if (file.size > 2_000_000) { failed.value = true; message.value = '头像须小于 2 MB'; return }
+  const form = new FormData(); form.append('file', file)
+  busy.value = true; failed.value = false
+  try { await api.post('/doctor/avatar', form); await loadAvatar(); message.value = '头像已更新' }
+  catch (error) { failed.value = true; message.value = error.message }
+  finally { busy.value = false; event.target.value = '' }
+}
 const recordVersion = ref(0), recordId = ref(null), correctionReason = ref('')
 const record = reactive({
   chiefComplaint: '',
@@ -28,6 +44,7 @@ async function refresh() {
     reviews.value = r.items;
     profile.specialty = p.profile.specialty || '';
     profile.intro = p.profile.intro || ''
+    if (p.profile.avatar_key) await loadAvatar()
   } catch (e) {
     message.value = e.message;
     failed.value = true
@@ -116,10 +133,16 @@ const time = value => value ? new Date(value.endsWith('Z') ? value : value + 'Z'
   hour12: false
 }) : ''
 onMounted(refresh)
+onUnmounted(() => { if (avatarUrl.value) URL.revokeObjectURL(avatarUrl.value) })
 </script>
 <template>
   <h1>医生工作台</h1>
   <p class="status" :class="{error:failed}" role="status" aria-live="polite">{{ message }}</p>
+  <section class="panel"><h2>头像</h2>
+    <img v-if="avatarUrl" :src="avatarUrl" alt="我的头像" width="96" height="96" class="avatar">
+    <label for="doctor-avatar">上传 JPEG、PNG 或 WebP 图片，最大 2 MB</label>
+    <input id="doctor-avatar" type="file" accept="image/jpeg,image/png,image/webp" :disabled="busy" @change="uploadAvatar">
+  </section>
   <section class="panel"><form action="/hospital/api/doctor/profile" method="post" aria-labelledby="doctor-profile-heading"
                        @submit.prevent="act(() => api.put('/doctor/profile', {...profile}))">
     <h2 id="doctor-profile-heading">医生资料</h2>

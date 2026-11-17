@@ -1,9 +1,13 @@
 <script setup>
-import {onMounted, reactive, ref} from 'vue'
-import {api} from '../api.js'
+import {onMounted, onUnmounted, reactive, ref} from 'vue'
+import {useRouter} from 'vue-router'
+import {api, session} from '../api.js'
 
 const props = defineProps({doctors: {type: Array, required: true}, appointments: {type: Array, required: true}})
 const profile = reactive({name: '', gender: '', birthday: ''})
+const phone = reactive({newPhone: '', code: '', currentPassword: ''})
+const router = useRouter()
+const avatarUrl = ref('')
 const archive = reactive({allergyHistory: '', pastHistory: '', note: '', version: 0})
 const favorites = ref([]), reviews = ref([]), feedback = ref([])
 const reviewFor = ref(''), favoriteChoice = ref('')
@@ -18,6 +22,7 @@ async function refresh() {
       api.get('/patient/reviews'), api.get('/patient/feedback'), api.get('/patient/profile')
     ])
     Object.assign(profile, {name: p.profile.name || '', gender: p.profile.gender || '', birthday: p.profile.birthday || ''})
+    if (p.profile.avatar_key) await loadAvatar()
     Object.assign(archive, {
       allergyHistory: a.archive.allergy_history || '', pastHistory: a.archive.past_history || '',
       note: a.archive.note || '', version: a.archive.version
@@ -29,6 +34,35 @@ async function refresh() {
     failed.value = true
     message.value = error.message
   }
+}
+async function loadAvatar() {
+  const blob = await api.get('/patient/avatar', {responseType: 'blob'})
+  if (avatarUrl.value) URL.revokeObjectURL(avatarUrl.value)
+  avatarUrl.value = URL.createObjectURL(blob)
+}
+async function uploadAvatar(event) {
+  const file = event.target.files?.[0]
+  if (!file) return
+  if (file.size > 2_000_000) { failed.value = true; message.value = '头像须小于 2 MB'; return }
+  const form = new FormData(); form.append('file', file)
+  busy.value = true; failed.value = false
+  try { await api.post('/patient/avatar', form); await loadAvatar(); message.value = '头像已更新' }
+  catch (error) { failed.value = true; message.value = error.message }
+  finally { busy.value = false; event.target.value = '' }
+}
+async function requestPhone() {
+  busy.value = true; failed.value = false
+  try { const result = await api.post('/patient/phone-change/request', {newPhone: phone.newPhone}); message.value = result.message }
+  catch (error) { failed.value = true; message.value = error.message }
+  finally { busy.value = false }
+}
+async function confirmPhone() {
+  busy.value = true; failed.value = false
+  try {
+    await api.post('/patient/phone-change/confirm', {...phone})
+    session.token = ''; session.role = ''; router.push('/login')
+  } catch (error) { failed.value = true; message.value = error.message }
+  finally { busy.value = false }
 }
 
 async function run(task) {
@@ -65,10 +99,17 @@ async function submitFeedback() {
 }
 
 onMounted(refresh)
+onUnmounted(() => { if (avatarUrl.value) URL.revokeObjectURL(avatarUrl.value) })
 </script>
 
 <template>
   <p class="status" :class="{error:failed}" role="status" aria-live="polite">{{ message }}</p>
+  <section class="panel">
+    <h2>头像</h2>
+    <img v-if="avatarUrl" :src="avatarUrl" alt="我的头像" width="96" height="96" class="avatar">
+    <label for="patient-avatar">上传 JPEG、PNG 或 WebP 图片，最大 2 MB</label>
+    <input id="patient-avatar" type="file" accept="image/jpeg,image/png,image/webp" :disabled="busy" @change="uploadAvatar">
+  </section>
   <section class="panel">
     <form action="/hospital/api/patient/profile" method="post" aria-labelledby="profile-heading"
           @submit.prevent="run(() => api.put('/patient/profile', {...profile}))">
@@ -80,6 +121,19 @@ onMounted(refresh)
       <label for="profile-birthday">出生日期</label><input id="profile-birthday" v-model="profile.birthday" name="birthday" type="date">
       <button class="primary" type="submit" :disabled="busy">保存个人资料</button>
     </form>
+  </section>
+  <section class="panel">
+    <h2>更换手机号</h2>
+    <form @submit.prevent="requestPhone">
+      <label for="new-phone">新手机号</label><input id="new-phone" v-model.trim="phone.newPhone" type="tel" inputmode="tel" autocomplete="tel" pattern="1[0-9]{10}" required>
+      <button type="submit" :disabled="busy">发送验证码</button>
+    </form>
+    <form @submit.prevent="confirmPhone">
+      <label for="phone-code">8 位验证码</label><input id="phone-code" v-model.trim="phone.code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{8}" maxlength="8" required>
+      <label for="phone-current-password">当前密码</label><input id="phone-current-password" v-model="phone.currentPassword" type="password" autocomplete="current-password" required>
+      <button type="submit" :disabled="busy">确认更换手机号</button>
+    </form>
+    <p class="muted">更换成功后需要重新登录。</p>
   </section>
   <section class="panel">
     <form action="/hospital/api/patient/health-archive" method="post" aria-labelledby="archive-heading"
@@ -158,4 +212,5 @@ onMounted(refresh)
 <style scoped>
 .check { width: auto; min-height: auto }
 .row label { margin: 0 }
+.avatar { object-fit: cover; border-radius: 50% }
 </style>

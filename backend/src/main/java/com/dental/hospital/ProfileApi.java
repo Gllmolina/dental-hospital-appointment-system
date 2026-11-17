@@ -39,7 +39,7 @@ public class ProfileApi {
     @GetMapping("/patient/profile")
     public Map<String, Object> patient(HttpServletRequest req) {
         Api.Actor actor = api.actor(req, "PATIENT");
-        return Map.of("code", 0, "profile", row("SELECT p.id,p.name,p.gender,p.birthday,u.username,u.phone FROM patient_profile p JOIN sys_user u ON u.id=p.user_id WHERE p.id=?", actor.profileId()));
+        return Map.of("code", 0, "profile", row("SELECT p.id,p.name,p.gender,p.birthday,p.avatar_key,u.username,u.phone FROM patient_profile p JOIN sys_user u ON u.id=p.user_id WHERE p.id=?", actor.profileId()));
     }
 
     @PutMapping("/patient/profile")
@@ -63,7 +63,7 @@ public class ProfileApi {
     @GetMapping("/doctor/profile")
     public Map<String, Object> doctor(HttpServletRequest req) {
         Api.Actor actor = api.actor(req, "DOCTOR");
-        return Map.of("code", 0, "profile", row("SELECT d.id,d.name,d.employee_no,d.title,d.specialty,d.intro,d.default_fee,dep.name department_name,u.username FROM doctor_profile d JOIN department dep ON dep.id=d.department_id JOIN sys_user u ON u.id=d.user_id WHERE d.id=?", actor.profileId()));
+        return Map.of("code", 0, "profile", row("SELECT d.id,d.name,d.employee_no,d.title,d.specialty,d.intro,d.default_fee,d.avatar_key,dep.name department_name,u.username FROM doctor_profile d JOIN department dep ON dep.id=d.department_id JOIN sys_user u ON u.id=d.user_id WHERE d.id=?", actor.profileId()));
     }
 
     @PutMapping("/doctor/profile")

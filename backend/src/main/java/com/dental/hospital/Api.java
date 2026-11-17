@@ -34,6 +34,10 @@ public class Api {
     private final ObjectMapper json;
     private final BCryptPasswordEncoder bcrypt = new BCryptPasswordEncoder();
     private static final ZoneId HOSPITAL = ZoneId.of("Asia/Shanghai");
+    private void checkRange(LocalDate from, LocalDate to) {
+        if (from != null && to != null && (to.isBefore(from) || to.isAfter(from.plusDays(89))))
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "日期范围最多90天");
+    }
     @Value("${booking.window-days:7}")
     private int windowDays;
     @Value("${booking.daily-limit:3}")
@@ -292,12 +296,22 @@ public class Api {
     }
 
     @GetMapping("/doctors")
-    public Map<String, Object> doctors(@RequestParam(required = false) Long departmentId) {
+    public Map<String, Object> doctors(@RequestParam(required = false) Long departmentId,
+                                       @RequestParam(required = false) String keyword,
+                                       @RequestParam(required = false) String title,
+                                       @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate visitDate) {
+        if (keyword != null && keyword.length() > 50 || title != null && title.length() > 60)
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "筛选条件过长");
+        if (visitDate != null && (visitDate.isBefore(LocalDate.now(HOSPITAL)) || visitDate.isAfter(LocalDate.now(HOSPITAL).plusDays(windowDays - 1L))))
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "日期超出预约窗口");
         String sql = "SELECT d.id,d.name,d.title,d.specialty,d.intro,d.default_fee,dep.name department_name," +
                 "(SELECT COUNT(*) FROM review r WHERE r.doctor_id=d.id AND r.visibility='VISIBLE') review_count," +
                 "(SELECT ROUND(AVG(r.overall_score),1) FROM review r WHERE r.doctor_id=d.id AND r.visibility='VISIBLE') rating_average " +
-                "FROM doctor_profile d JOIN department dep ON dep.id=d.department_id JOIN sys_user u ON u.id=d.user_id WHERE d.status='ACTIVE' AND u.status='ACTIVE' AND dep.enabled=TRUE";
-        return Map.of("code", 0, "items", departmentId == null ? rows(sql + " ORDER BY d.id") : rows(sql + " AND d.department_id=? ORDER BY d.id", departmentId));
+                "FROM doctor_profile d JOIN department dep ON dep.id=d.department_id JOIN sys_user u ON u.id=d.user_id WHERE d.status='ACTIVE' AND u.status='ACTIVE' AND dep.enabled=TRUE" +
+                " AND (? IS NULL OR d.department_id=?) AND (? IS NULL OR d.name LIKE ? OR d.specialty LIKE ?)" +
+                " AND (? IS NULL OR d.title=?) AND (? IS NULL OR EXISTS (SELECT 1 FROM schedule s JOIN schedule_slot sl ON sl.schedule_id=s.id WHERE s.doctor_id=d.id AND s.visit_date=? AND s.status='PUBLISHED' AND sl.status='OPEN' AND sl.remaining>0 AND sl.starts_at>UTC_TIMESTAMP(3))) ORDER BY d.id LIMIT 200";
+        String term = keyword == null ? null : "%" + keyword.trim() + "%";
+        return Map.of("code", 0, "items", rows(sql, departmentId, departmentId, keyword, term, term, title, title, visitDate, visitDate));
     }
 
     @GetMapping("/doctors/{id}")
@@ -307,9 +321,14 @@ public class Api {
     }
 
     @GetMapping("/doctors/{id}/slots")
-    public Map<String, Object> slots(@PathVariable long id) {
+    public Map<String, Object> slots(@PathVariable long id,
+                                     @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+                                     @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to) {
         LocalDate today = LocalDate.now(HOSPITAL);
-        return Map.of("code", 0, "items", rows("SELECT sl.id slot_id,sl.starts_at,sl.ends_at,sl.remaining,sl.fee,r.name room_name FROM schedule_slot sl JOIN schedule s ON s.id=sl.schedule_id JOIN clinic_room r ON r.id=s.room_id WHERE s.doctor_id=? AND s.status='PUBLISHED' AND sl.status='OPEN' AND sl.remaining>0 AND sl.starts_at>UTC_TIMESTAMP(3) AND s.visit_date BETWEEN ? AND ? ORDER BY sl.starts_at", id, today, today.plusDays(setting("booking.windowDays", windowDays) - 1L)));
+        LocalDate end = today.plusDays(setting("booking.windowDays", windowDays) - 1L);
+        LocalDate start = from == null ? today : from, finish = to == null ? end : to;
+        if (start.isBefore(today) || finish.isAfter(end) || finish.isBefore(start)) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "日期超出预约窗口");
+        return Map.of("code", 0, "items", rows("SELECT sl.id slot_id,sl.starts_at,sl.ends_at,sl.remaining,sl.fee,r.name room_name FROM schedule_slot sl JOIN schedule s ON s.id=sl.schedule_id JOIN clinic_room r ON r.id=s.room_id WHERE s.doctor_id=? AND s.status='PUBLISHED' AND sl.status='OPEN' AND sl.remaining>0 AND sl.starts_at>UTC_TIMESTAMP(3) AND s.visit_date BETWEEN ? AND ? ORDER BY sl.starts_at", id, start, finish));
     }
 
     @GetMapping("/admin/departments")
@@ -449,14 +468,18 @@ public class Api {
     }
 
     @GetMapping("/patient/appointments")
-    public Map<String, Object> mine(HttpServletRequest req) {
+    public Map<String, Object> mine(HttpServletRequest req, @RequestParam(required = false) String status,
+                                    @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+                                    @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to) {
         Actor a = actor(req, "PATIENT");
+        checkRange(from, to);
+        if (status != null && !List.of("PENDING_PAYMENT","BOOKED","CHECKED_IN","IN_VISIT","COMPLETED","CANCELLED","EXPIRED","NO_SHOW").contains(status)) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "状态无效");
         return Map.of("code", 0, "items", rows("""
                 SELECT a.*,s.status='SUSPENDED' AND a.status IN ('PENDING_PAYMENT','BOOKED') disruption_open,
                     s.status='PUBLISHED' AND a.status='BOOKED' AND a.cancel_deadline_at>=UTC_TIMESTAMP(3) can_reschedule
                 FROM appointment a JOIN schedule_slot sl ON sl.id=a.slot_id JOIN schedule s ON s.id=sl.schedule_id
-                WHERE a.patient_id=? ORDER BY a.created_at DESC,a.id DESC LIMIT 100
-                """, a.profileId));
+                WHERE a.patient_id=? AND (? IS NULL OR a.status=?) AND (? IS NULL OR a.visit_date>=?) AND (? IS NULL OR a.visit_date<=?) ORDER BY a.created_at DESC,a.id DESC LIMIT 100
+                """, a.profileId, status, status, from, from, to, to));
     }
 
     @GetMapping("/appointments/{id}")
@@ -467,9 +490,10 @@ public class Api {
     }
 
     @GetMapping("/patient/bills")
-    public Map<String, Object> bills(HttpServletRequest req) {
+    public Map<String, Object> bills(HttpServletRequest req, @RequestParam(required = false) String status, @RequestParam(required = false) String type) {
         Actor a = actor(req, "PATIENT");
-        return Map.of("code", 0, "items", rows("SELECT * FROM bill WHERE patient_id=? ORDER BY created_at DESC", a.profileId));
+        if (status != null && !List.of("UNPAID","PAID","CANCELLED","REFUNDED","REFUND_PENDING").contains(status) || type != null && !List.of("REGISTRATION","TREATMENT").contains(type)) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "账单筛选无效");
+        return Map.of("code", 0, "items", rows("SELECT * FROM bill WHERE patient_id=? AND (? IS NULL OR status=?) AND (? IS NULL OR type=?) ORDER BY created_at DESC LIMIT 200", a.profileId, status, status, type, type));
     }
 
     @GetMapping("/bills/{id}")
@@ -756,9 +780,15 @@ public class Api {
     }
 
     @GetMapping("/doctor/appointments")
-    public Map<String, Object> doctorAppointments(HttpServletRequest req) {
+    public Map<String, Object> doctorAppointments(HttpServletRequest req,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            @RequestParam(required = false) String status, @RequestParam(required = false) String keyword) {
         Actor a = actor(req, "DOCTOR");
-        return Map.of("code", 0, "items", rows("SELECT * FROM appointment WHERE doctor_id=? AND visit_date=? ORDER BY starts_at", a.profileId, LocalDate.now(HOSPITAL)));
+        LocalDate start = from == null ? LocalDate.now(HOSPITAL) : from, finish = to == null ? start : to;
+        checkRange(start, finish);
+        if (keyword != null && keyword.length() > 50) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "关键词过长");
+        return Map.of("code", 0, "items", rows("SELECT a.* FROM appointment a JOIN patient_profile p ON p.id=a.patient_id WHERE a.doctor_id=? AND a.visit_date BETWEEN ? AND ? AND (? IS NULL OR a.status=?) AND (? IS NULL OR p.name LIKE ? OR a.appointment_no LIKE ?) ORDER BY a.starts_at LIMIT 200", a.profileId, start, finish, status, status, keyword, keyword == null ? null : "%" + keyword + "%", keyword == null ? null : "%" + keyword + "%"));
     }
 
     @GetMapping("/doctor/treatment-items")
@@ -855,9 +885,13 @@ public class Api {
     }
 
     @GetMapping("/patient/medical-records")
-    public Map<String, Object> records(HttpServletRequest req) {
+    public Map<String, Object> records(HttpServletRequest req,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            @RequestParam(required = false) Long doctorId, @RequestParam(required = false) Long departmentId) {
         Actor a = actor(req, "PATIENT");
-        return Map.of("code", 0, "items", rows("SELECT r.* FROM medical_record r JOIN appointment a ON a.id=r.appointment_id WHERE a.patient_id=? AND r.status='PUBLISHED' ORDER BY r.published_at DESC", a.profileId));
+        checkRange(from, to);
+        return Map.of("code", 0, "items", rows("SELECT r.* FROM medical_record r JOIN appointment a ON a.id=r.appointment_id WHERE a.patient_id=? AND r.status='PUBLISHED' AND (? IS NULL OR a.visit_date>=?) AND (? IS NULL OR a.visit_date<=?) AND (? IS NULL OR a.doctor_id=?) AND (? IS NULL OR a.department_id=?) ORDER BY r.published_at DESC LIMIT 200", a.profileId, from, from, to, to, doctorId, doctorId, departmentId, departmentId));
     }
 
     @GetMapping("/medical-records/{id}")
