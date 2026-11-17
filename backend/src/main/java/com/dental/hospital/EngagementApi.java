@@ -131,7 +131,7 @@ public class EngagementApi {
     @GetMapping("/doctor/reviews")
     public Map<String, Object> doctorReviews(HttpServletRequest req) {
         Api.Actor actor = api.actor(req, "DOCTOR");
-        return Map.of("code", 0, "items", db.queryForList("SELECT r.id,r.service_score,r.communication_score,r.overall_score,r.content,r.anonymous,r.visibility,r.reply,r.replied_at,r.created_at,CASE WHEN r.anonymous THEN '匿名患者' ELSE p.name END display_name FROM review r JOIN patient_profile p ON p.id=r.patient_id WHERE r.doctor_id=? AND r.visibility='VISIBLE' ORDER BY r.id DESC", actor.profileId()));
+        return Map.of("code", 0, "items", db.queryForList("SELECT r.id,r.service_score,r.communication_score,r.overall_score,r.content,r.anonymous,r.visibility,r.reply,r.replied_at,r.created_at,ap.status appeal_status,CASE WHEN r.anonymous THEN '匿名患者' ELSE p.name END display_name FROM review r JOIN patient_profile p ON p.id=r.patient_id LEFT JOIN review_appeal ap ON ap.review_id=r.id WHERE r.doctor_id=? AND r.visibility='VISIBLE' ORDER BY r.id DESC", actor.profileId()));
     }
 
     @PostMapping("/doctor/reviews/{id}/reply")

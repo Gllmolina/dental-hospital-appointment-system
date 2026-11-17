@@ -57,6 +57,12 @@ public class Api {
         return n == null ? 0 : n;
     }
 
+    private int setting(String key, int fallback) {
+        List<Integer> values = db.query("SELECT config_value FROM system_config WHERE config_key=?",
+                (rs, n) -> Integer.parseInt(rs.getString(1)), key);
+        return values.isEmpty() ? fallback : values.get(0);
+    }
+
     private Map<String, Object> row(String sql, Object... args) {
         List<Map<String, Object>> rows = db.queryForList(sql, args);
         if (rows.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "资源不存在");
@@ -181,7 +187,7 @@ public class Api {
     private void checkPatientAvailability(long patient, long excluded, LocalDate day,
                                           LocalDateTime start, LocalDateTime end) {
         check(id("SELECT COUNT(*) FROM appointment WHERE patient_id=? AND id<>? AND visit_date=? AND status NOT IN('CANCELLED','EXPIRED')",
-                patient, excluded, day) < dailyLimit, "超过每日预约上限");
+                patient, excluded, day) < setting("booking.dailyLimit", dailyLimit), "超过每日预约上限");
         check(id("SELECT COUNT(*) FROM appointment WHERE patient_id=? AND id<>? AND status NOT IN('CANCELLED','EXPIRED') AND starts_at<? AND ends_at>?",
                 patient, excluded, end, start) == 0, "时间重叠");
     }
@@ -189,7 +195,7 @@ public class Api {
     private void checkBookable(Map<String, Object> schedule, Map<String, Object> slot, LocalDateTime now) {
         LocalDate today = now.atOffset(ZoneOffset.UTC).atZoneSameInstant(HOSPITAL).toLocalDate();
         LocalDate day = date(schedule.get("visit_date"));
-        check(!day.isBefore(today) && day.isBefore(today.plusDays(windowDays))
+        check(!day.isBefore(today) && day.isBefore(today.plusDays(setting("booking.windowDays", windowDays)))
                 && dateTime(slot.get("starts_at")).isAfter(now), "不在预约窗口");
         check("PUBLISHED".equals(schedule.get("status")) && "OPEN".equals(slot.get("status"))
                 && num(slot, "remaining") > 0, "号源不可用");
@@ -287,13 +293,23 @@ public class Api {
 
     @GetMapping("/doctors")
     public Map<String, Object> doctors(@RequestParam(required = false) Long departmentId) {
-        return Map.of("code", 0, "items", departmentId == null ? rows("SELECT d.id,d.name,d.title,d.specialty,d.intro,d.default_fee,dep.name department_name FROM doctor_profile d JOIN department dep ON dep.id=d.department_id JOIN sys_user u ON u.id=d.user_id WHERE d.status='ACTIVE' AND u.status='ACTIVE'") : rows("SELECT d.id,d.name,d.title,d.specialty,d.intro,d.default_fee,dep.name department_name FROM doctor_profile d JOIN department dep ON dep.id=d.department_id JOIN sys_user u ON u.id=d.user_id WHERE d.status='ACTIVE' AND u.status='ACTIVE' AND d.department_id=?", departmentId));
+        String sql = "SELECT d.id,d.name,d.title,d.specialty,d.intro,d.default_fee,dep.name department_name," +
+                "(SELECT COUNT(*) FROM review r WHERE r.doctor_id=d.id AND r.visibility='VISIBLE') review_count," +
+                "(SELECT ROUND(AVG(r.overall_score),1) FROM review r WHERE r.doctor_id=d.id AND r.visibility='VISIBLE') rating_average " +
+                "FROM doctor_profile d JOIN department dep ON dep.id=d.department_id JOIN sys_user u ON u.id=d.user_id WHERE d.status='ACTIVE' AND u.status='ACTIVE' AND dep.enabled=TRUE";
+        return Map.of("code", 0, "items", departmentId == null ? rows(sql + " ORDER BY d.id") : rows(sql + " AND d.department_id=? ORDER BY d.id", departmentId));
+    }
+
+    @GetMapping("/doctors/{id}")
+    public Map<String, Object> doctorDetail(@PathVariable long id) {
+        Map<String, Object> doctor = row("SELECT d.id,d.name,d.title,d.specialty,d.intro,d.default_fee,dep.name department_name FROM doctor_profile d JOIN department dep ON dep.id=d.department_id JOIN sys_user u ON u.id=d.user_id WHERE d.id=? AND d.status='ACTIVE' AND u.status='ACTIVE'", id);
+        return Map.of("code", 0, "doctor", doctor, "reviews", rows("SELECT overall_score,service_score,communication_score,content,anonymous,reply,created_at FROM review WHERE doctor_id=? AND visibility='VISIBLE' ORDER BY id DESC LIMIT 20", id));
     }
 
     @GetMapping("/doctors/{id}/slots")
     public Map<String, Object> slots(@PathVariable long id) {
         LocalDate today = LocalDate.now(HOSPITAL);
-        return Map.of("code", 0, "items", rows("SELECT sl.id slot_id,sl.starts_at,sl.ends_at,sl.remaining,sl.fee,r.name room_name FROM schedule_slot sl JOIN schedule s ON s.id=sl.schedule_id JOIN clinic_room r ON r.id=s.room_id WHERE s.doctor_id=? AND s.status='PUBLISHED' AND sl.status='OPEN' AND sl.remaining>0 AND sl.starts_at>UTC_TIMESTAMP(3) AND s.visit_date BETWEEN ? AND ? ORDER BY sl.starts_at", id, today, today.plusDays(windowDays - 1L)));
+        return Map.of("code", 0, "items", rows("SELECT sl.id slot_id,sl.starts_at,sl.ends_at,sl.remaining,sl.fee,r.name room_name FROM schedule_slot sl JOIN schedule s ON s.id=sl.schedule_id JOIN clinic_room r ON r.id=s.room_id WHERE s.doctor_id=? AND s.status='PUBLISHED' AND sl.status='OPEN' AND sl.remaining>0 AND sl.starts_at>UTC_TIMESTAMP(3) AND s.visit_date BETWEEN ? AND ? ORDER BY sl.starts_at", id, today, today.plusDays(setting("booking.windowDays", windowDays) - 1L)));
     }
 
     @GetMapping("/admin/departments")
@@ -389,9 +405,10 @@ public class Api {
         check(conflicts.isEmpty(), "医生或诊室排班冲突");
         LocalDateTime start = dateTime(s.get("starts_at")), end = dateTime(s.get("ends_at"));
         check(start.isAfter(utcNow()), "排班已开始");
-        for (LocalDateTime t = start; t.isBefore(end); t = t.plusMinutes(30)) {
-            LocalDateTime next = t.plusMinutes(30);
-            check(!next.isAfter(end), "排班须按30分钟整分");
+        int slotMinutes = setting("schedule.slotMinutes", 30);
+        for (LocalDateTime t = start; t.isBefore(end); t = t.plusMinutes(slotMinutes)) {
+            LocalDateTime next = t.plusMinutes(slotMinutes);
+            check(!next.isAfter(end), "排班须按配置的时段长度整分");
             db.update("INSERT INTO schedule_slot(schedule_id,starts_at,ends_at,capacity,remaining,fee) VALUES(?,?,?,?,?,?)", id, t, next, s.get("capacity"), s.get("capacity"), s.get("fee"));
         }
         db.update("UPDATE schedule SET status='PUBLISHED',version=version+1 WHERE id=?", id);
@@ -417,8 +434,9 @@ public class Api {
         checkPatientAvailability(a.profileId, 0, date, start, end);
         check(db.update("UPDATE schedule_slot SET remaining=remaining-1 WHERE id=? AND remaining>0 AND status='OPEN'", slot) == 1, "号源已满");
         String no = "A" + UUID.randomUUID().toString().replace("-", "").substring(0, 20);
-        LocalDateTime expiry = now.plusMinutes(15).isBefore(start) ? now.plusMinutes(15) : start;
-        long appt = insert("INSERT INTO appointment(appointment_no,patient_id,doctor_id,department_id,slot_id,visit_date,starts_at,ends_at,status,registration_fee,pay_expires_at,cancel_deadline_at,check_in_opens_at,symptom_summary) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", no, a.profileId, schedule.get("doctor_id"), schedule.get("department_id"), slot, date, start, end, "PENDING_PAYMENT", sl.get("fee"), expiry, start.minusMinutes(cancelBefore), start.minusMinutes(checkInEarly), symptom);
+        int holdMinutes = setting("booking.holdMinutes", 15);
+        LocalDateTime expiry = now.plusMinutes(holdMinutes).isBefore(start) ? now.plusMinutes(holdMinutes) : start;
+        long appt = insert("INSERT INTO appointment(appointment_no,patient_id,doctor_id,department_id,slot_id,visit_date,starts_at,ends_at,status,registration_fee,pay_expires_at,cancel_deadline_at,check_in_opens_at,symptom_summary) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", no, a.profileId, schedule.get("doctor_id"), schedule.get("department_id"), slot, date, start, end, "PENDING_PAYMENT", sl.get("fee"), expiry, start.minusMinutes(setting("booking.cancelBeforeMinutes", cancelBefore)), start.minusMinutes(setting("booking.checkInEarlyMinutes", checkInEarly)), symptom);
         long bill = insert("INSERT INTO bill(bill_no,appointment_id,patient_id,type,amount,status) VALUES(?,?,?,'REGISTRATION',?,'UNPAID')", "B" + no, appt, a.profileId, sl.get("fee"));
         db.update("INSERT INTO bill_item(bill_id,item_code,item_name,quantity,unit_price,line_amount) VALUES(?,'REG','挂号费',1,?,?)", bill, sl.get("fee"), sl.get("fee"));
         event(appt, "BOOK", null, "PENDING_PAYMENT", a.id, null);
@@ -563,8 +581,8 @@ public class Api {
                             AND other.visit_date=s.visit_date
                     ) < ?
                 ORDER BY sl.starts_at,sl.id LIMIT 100
-                """, today, today.plusDays(windowDays - 1L), ap.get("registration_fee"), ap.get("slot_id"),
-                ap.get("patient_id"), id, ap.get("patient_id"), id, dailyLimit));
+                """, today, today.plusDays(setting("booking.windowDays", windowDays) - 1L), ap.get("registration_fee"), ap.get("slot_id"),
+                ap.get("patient_id"), id, ap.get("patient_id"), id, setting("booking.dailyLimit", dailyLimit)));
     }
 
     private Map<String, Object> rescheduleAppointment(Actor actor, long id, boolean lock) {
@@ -632,7 +650,7 @@ public class Api {
                     UPDATE appointment SET slot_id=?,doctor_id=?,department_id=?,visit_date=?,starts_at=?,ends_at=?,
                         cancel_deadline_at=?,check_in_opens_at=? WHERE id=?
                     """, targetSlot, target.get("doctor_id"), target.get("department_id"), day, start, end,
-                    start.minusMinutes(cancelBefore), start.minusMinutes(checkInEarly), id);
+                    start.minusMinutes(setting("booking.cancelBeforeMinutes", cancelBefore)), start.minusMinutes(setting("booking.checkInEarlyMinutes", checkInEarly)), id);
             event(id, "RESCHEDULE", "BOOKED", "BOOKED", actor.id, reason);
             db.update("UPDATE system_message SET revoked_at=UTC_TIMESTAMP(3) WHERE appointment_id=? AND type='VISIT_REMINDER' AND read_at IS NULL AND revoked_at IS NULL", id);
             if (suspended) resolveDisruption(id, originalSchedule, "RESCHEDULED");

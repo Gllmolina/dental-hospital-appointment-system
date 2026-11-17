@@ -708,4 +708,55 @@ class ConcurrencyAcceptanceTest {
         assertEquals(3, count("SELECT COUNT(*) FROM medical_record_version WHERE record_id=?", record));
         assertEquals("已复查", db.queryForObject("SELECT examination FROM medical_record WHERE id=?", String.class, record));
     }
+
+    @Test
+    void reviewAppealHidesRatingAfterApproval() {
+        Fixture f = fixture(1, future());
+        User patient = user("PATIENT", 0), doctor = userForDoctor(f.doctorId), admin = user("ADMIN", 0);
+        ResponseEntity<Map> created = http("POST", "/appointments", patient.token, UUID.randomUUID().toString(), Map.of("slotId", Long.toString(f.slotId)));
+        long appointment = appointmentId(created);
+        assertEquals(200, http("POST", "/bills/" + billId(created) + "/mock-pay", patient.token, UUID.randomUUID().toString(), Map.of()).getStatusCodeValue());
+        db.update("UPDATE appointment SET status='COMPLETED' WHERE id=?", appointment);
+        assertEquals(200, http("POST", "/appointments/" + appointment + "/review", patient.token, null,
+                Map.of("serviceScore", 2, "communicationScore", 2, "overallScore", 2, "content", "测试评价", "anonymous", false)).getStatusCodeValue());
+        long review = count("SELECT id FROM review WHERE appointment_id=?", appointment);
+        assertEquals(200, http("POST", "/doctor/reviews/" + review + "/appeal", doctor.token, null, Map.of("reason", "事实有误")).getStatusCodeValue());
+        assertEquals(409, http("POST", "/doctor/reviews/" + review + "/appeal", doctor.token, null, Map.of("reason", "再次申诉")).getStatusCodeValue());
+        long appeal = count("SELECT id FROM review_appeal WHERE review_id=?", review);
+        assertEquals(200, http("PUT", "/admin/review-appeals/" + appeal + "/decision", admin.token, null,
+                Map.of("decision", "APPROVED", "decisionNote", "审核同意")).getStatusCodeValue());
+        assertEquals(0, count("SELECT COUNT(*) FROM review WHERE id=? AND visibility='VISIBLE'", review));
+        List<?> publicReviews = (List<?>) http("GET", "/doctors/" + f.doctorId, patient.token, null, null).getBody().get("reviews");
+        assertTrue(publicReviews.isEmpty());
+    }
+
+    @Test
+    void doctorContextShowsOnlyAssignedPatientAfterCheckIn() {
+        Fixture f = fixture(1, future());
+        User patient = user("PATIENT", 0), assigned = userForDoctor(f.doctorId), other = user("DOCTOR", f.departmentId);
+        long appointment = appointmentId(http("POST", "/appointments", patient.token, UUID.randomUUID().toString(), Map.of("slotId", Long.toString(f.slotId))));
+        assertEquals(200, http("PUT", "/patient/health-archive", patient.token, null,
+                Map.of("version", 0, "allergyHistory", "测试过敏史", "pastHistory", "无", "note", "仅授权医生可见")).getStatusCodeValue());
+        assertEquals(409, http("GET", "/doctor/appointments/" + appointment + "/context", assigned.token, null, null).getStatusCodeValue());
+        db.update("UPDATE appointment SET status='CHECKED_IN' WHERE id=?", appointment);
+        assertEquals(404, http("GET", "/doctor/appointments/" + appointment + "/context", other.token, null, null).getStatusCodeValue());
+        ResponseEntity<Map> result = http("GET", "/doctor/appointments/" + appointment + "/context", assigned.token, null, null);
+        assertEquals(200, result.getStatusCodeValue());
+        assertEquals("测试过敏史", ((Map<?, ?>) result.getBody().get("healthArchive")).get("allergy_history"));
+    }
+
+    @Test
+    void settingsValidateBoundsAndOptimisticVersion() {
+        User admin = user("ADMIN", 0), patient = user("PATIENT", 0);
+        assertEquals(403, http("GET", "/admin/settings", patient.token, null, null).getStatusCodeValue());
+        List<Map> items = (List<Map>) http("GET", "/admin/settings", admin.token, null, null).getBody().get("items");
+        Map setting = items.stream().filter(x -> "booking.windowDays".equals(x.get("config_key"))).findFirst().orElseThrow();
+        int version = ((Number) setting.get("version")).intValue();
+        assertEquals(400, http("PUT", "/admin/settings/booking.windowDays", admin.token, null,
+                Map.of("value", 99, "version", version, "reason", "测试越界")).getStatusCodeValue());
+        assertEquals(200, http("PUT", "/admin/settings/booking.windowDays", admin.token, null,
+                Map.of("value", 7, "version", version, "reason", "保持默认值")).getStatusCodeValue());
+        assertEquals(409, http("PUT", "/admin/settings/booking.windowDays", admin.token, null,
+                Map.of("value", 7, "version", version, "reason", "过期版本")).getStatusCodeValue());
+    }
 }

@@ -9,6 +9,8 @@ import RescheduleForm from './RescheduleForm.vue'
 import AdminFeedback from './AdminFeedback.vue'
 import LeaveRequests from './LeaveRequests.vue'
 import KnowledgeAdmin from './KnowledgeAdmin.vue'
+import ReviewAppeals from './ReviewAppeals.vue'
+import AdminSettings from './AdminSettings.vue'
 
 const tab = ref('overview'), busy = ref(false), message = ref(''), failed = ref(false)
 echarts.use([BarChart, GridComponent, TooltipComponent, LegendComponent, CanvasRenderer])
@@ -483,6 +485,12 @@ onUnmounted(() => {
     </el-tab-pane>
     <el-tab-pane label="知识库" name="knowledge">
       <KnowledgeAdmin/>
+    </el-tab-pane>
+    <el-tab-pane label="评价申诉" name="review-appeals">
+      <ReviewAppeals/>
+    </el-tab-pane>
+    <el-tab-pane label="业务参数" name="settings">
+      <AdminSettings/>
     </el-tab-pane>
   </el-tabs>
 </template>

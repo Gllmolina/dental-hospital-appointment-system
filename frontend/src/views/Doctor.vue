@@ -6,6 +6,8 @@ import LeaveRequests from './LeaveRequests.vue'
 const appointments = ref([]), catalog = ref([]), reviews = ref([]), selected = ref(null), busy = ref(false), message = ref(''),
     failed = ref(false)
 const reply = ref({})
+const appealReason = ref({})
+const profile = reactive({specialty: '', intro: ''}), context = ref(null)
 const recordVersion = ref(0), recordId = ref(null), correctionReason = ref('')
 const record = reactive({
   chiefComplaint: '',
@@ -20,10 +22,12 @@ const record = reactive({
 
 async function refresh() {
   try {
-    const [a, c, r] = await Promise.all([api.get('/doctor/appointments'), api.get('/doctor/treatment-items'), api.get('/doctor/reviews')]);
+    const [a, c, r, p] = await Promise.all([api.get('/doctor/appointments'), api.get('/doctor/treatment-items'), api.get('/doctor/reviews'), api.get('/doctor/profile')]);
     appointments.value = a.items;
     catalog.value = c.items;
-    reviews.value = r.items
+    reviews.value = r.items;
+    profile.specialty = p.profile.specialty || '';
+    profile.intro = p.profile.intro || ''
   } catch (e) {
     message.value = e.message;
     failed.value = true
@@ -77,6 +81,8 @@ function recordBody() {
 async function openRecord(appointment) {
   selected.value = appointment
   try {
+    context.value = ['CHECKED_IN', 'IN_VISIT'].includes(appointment.status)
+      ? await api.get(`/doctor/appointments/${appointment.id}/context`) : null
     const found = (await api.get(`/doctor/appointments/${appointment.id}/medical-record/draft`)).record
     recordId.value = found.id || null
     recordVersion.value = found.version || 0
@@ -114,6 +120,13 @@ onMounted(refresh)
 <template>
   <h1>医生工作台</h1>
   <p class="status" :class="{error:failed}" role="status" aria-live="polite">{{ message }}</p>
+  <section class="panel"><form action="/hospital/api/doctor/profile" method="post" aria-labelledby="doctor-profile-heading"
+                       @submit.prevent="act(() => api.put('/doctor/profile', {...profile}))">
+    <h2 id="doctor-profile-heading">医生资料</h2>
+    <label for="specialty">擅长方向</label><textarea id="specialty" v-model.trim="profile.specialty" name="specialty" maxlength="500"></textarea>
+    <label for="intro">个人介绍</label><textarea id="intro" v-model.trim="profile.intro" name="intro" maxlength="1000"></textarea>
+    <button class="primary" type="submit" :disabled="busy">保存医生资料</button>
+  </form></section>
   <section class="panel"><h2>今日预约</h2>
     <p v-if="!appointments.length">今日暂无预约。</p>
     <div v-for="a in appointments" :key="a.id" class="record"><strong>预约 {{ a.appointment_no }} · {{
@@ -132,6 +145,12 @@ onMounted(refresh)
     </div>
   </section>
   <section v-if="selected" class="panel">
+    <div v-if="context" class="record">
+      <h2>接诊资料 · {{ context.patient.name }}</h2>
+      <p>过敏史：{{ context.healthArchive.allergy_history || '未填写' }}</p>
+      <p>既往史：{{ context.healthArchive.past_history || '未填写' }}</p>
+      <p v-for="prior in context.priorRecords" :key="prior.id">既往记录：{{ prior.chief_complaint }} · {{ prior.advice }}</p>
+    </div>
     <form aria-labelledby="record-heading" action="/hospital/api/doctor/appointments" method="post"
           @submit.prevent="submit"><h2 id="record-heading">{{ selected.status === 'COMPLETED' ? '修订记录' : '就诊记录' }} · 预约 {{ selected.id }}</h2>
       <p>当前版本 {{ recordVersion }}。草稿仅医生可见。</p>
@@ -177,6 +196,14 @@ onMounted(refresh)
         <label :for="`reply-${item.id}`">回复内容</label>
         <textarea :id="`reply-${item.id}`" v-model.trim="reply[item.id]" name="content" maxlength="500" required></textarea>
         <button class="primary" type="submit" :disabled="busy">发送回复</button>
+      </form>
+      <p v-if="item.appeal_status">申诉状态：{{ item.appeal_status }}</p>
+      <form v-else :aria-labelledby="`review-appeal-${item.id}`" :action="`/hospital/api/doctor/reviews/${item.id}/appeal`"
+            method="post" @submit.prevent="act(() => api.post(`/doctor/reviews/${item.id}/appeal`, {reason: appealReason[item.id]}))">
+        <h3 :id="`review-appeal-${item.id}`">申请评价复核</h3>
+        <label :for="`appeal-${item.id}`">申诉原因</label>
+        <textarea :id="`appeal-${item.id}`" v-model.trim="appealReason[item.id]" name="reason" maxlength="500" required></textarea>
+        <button class="quiet" type="submit" :disabled="busy">提交申诉</button>
       </form>
     </article>
   </section>

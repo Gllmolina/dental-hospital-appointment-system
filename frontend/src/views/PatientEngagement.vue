@@ -3,6 +3,7 @@ import {onMounted, reactive, ref} from 'vue'
 import {api} from '../api.js'
 
 const props = defineProps({doctors: {type: Array, required: true}, appointments: {type: Array, required: true}})
+const profile = reactive({name: '', gender: '', birthday: ''})
 const archive = reactive({allergyHistory: '', pastHistory: '', note: '', version: 0})
 const favorites = ref([]), reviews = ref([]), feedback = ref([])
 const reviewFor = ref(''), favoriteChoice = ref('')
@@ -12,10 +13,11 @@ const busy = ref(false), message = ref(''), failed = ref(false)
 
 async function refresh() {
   try {
-    const [a, f, r, b] = await Promise.all([
+    const [a, f, r, b, p] = await Promise.all([
       api.get('/patient/health-archive'), api.get('/patient/favorites'),
-      api.get('/patient/reviews'), api.get('/patient/feedback')
+      api.get('/patient/reviews'), api.get('/patient/feedback'), api.get('/patient/profile')
     ])
+    Object.assign(profile, {name: p.profile.name || '', gender: p.profile.gender || '', birthday: p.profile.birthday || ''})
     Object.assign(archive, {
       allergyHistory: a.archive.allergy_history || '', pastHistory: a.archive.past_history || '',
       note: a.archive.note || '', version: a.archive.version
@@ -67,6 +69,18 @@ onMounted(refresh)
 
 <template>
   <p class="status" :class="{error:failed}" role="status" aria-live="polite">{{ message }}</p>
+  <section class="panel">
+    <form action="/hospital/api/patient/profile" method="post" aria-labelledby="profile-heading"
+          @submit.prevent="run(() => api.put('/patient/profile', {...profile}))">
+      <h2 id="profile-heading">个人资料</h2>
+      <label for="profile-name">姓名</label><input id="profile-name" v-model.trim="profile.name" name="name" autocomplete="name" maxlength="30" required>
+      <label for="profile-gender">性别</label><select id="profile-gender" v-model="profile.gender" name="gender">
+        <option value="">未填写</option><option value="MALE">男</option><option value="FEMALE">女</option><option value="OTHER">其他</option>
+      </select>
+      <label for="profile-birthday">出生日期</label><input id="profile-birthday" v-model="profile.birthday" name="birthday" type="date">
+      <button class="primary" type="submit" :disabled="busy">保存个人资料</button>
+    </form>
+  </section>
   <section class="panel">
     <form action="/hospital/api/patient/health-archive" method="post" aria-labelledby="archive-heading"
           @submit.prevent="run(() => api.put('/patient/health-archive', {...archive}))">
