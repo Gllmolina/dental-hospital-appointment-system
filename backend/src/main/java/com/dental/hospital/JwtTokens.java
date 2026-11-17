@@ -33,7 +33,9 @@ public class JwtTokens {
             SignedJWT jwt = new SignedJWT(new JWSHeader(JWSAlgorithm.HS256), claims);
             jwt.sign(new MACSigner(secret));
             return jwt.serialize();
-        } catch (Exception e) { throw new IllegalStateException("JWT signing failed", e); }
+        } catch (Exception e) {
+            throw new IllegalStateException("JWT signing failed", e);
+        }
     }
 
     public Claims verify(String token) {
@@ -49,8 +51,11 @@ public class JwtTokens {
                     || claims.getJWTID() == null || claims.getJWTID().isBlank())
                 throw new IllegalArgumentException("JWT claims invalid");
             return new Claims(Long.parseLong(claims.getSubject()), claims.getJWTID());
-        } catch (Exception e) { throw new IllegalArgumentException("JWT invalid", e); }
+        } catch (Exception e) {
+            throw new IllegalArgumentException("JWT invalid", e);
+        }
     }
 
-    public record Claims(long userId, String jti) {}
+    public record Claims(long userId, String jti) {
+    }
 }

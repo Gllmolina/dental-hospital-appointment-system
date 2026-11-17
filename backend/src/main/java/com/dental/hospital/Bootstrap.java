@@ -6,14 +6,14 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.util.List;
-import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @Component
 public class Bootstrap implements CommandLineRunner {
+    private static final Logger log = LoggerFactory.getLogger(Bootstrap.class);
     private final JdbcTemplate db;
+    private final Api api;
     @Value("${ADMIN_USERNAME:}")
     private String username;
     @Value("${ADMIN_PHONE:}")
@@ -21,8 +21,9 @@ public class Bootstrap implements CommandLineRunner {
     @Value("${ADMIN_PASSWORD:}")
     private String password;
 
-    public Bootstrap(JdbcTemplate db) {
+    public Bootstrap(JdbcTemplate db, Api api) {
         this.db = db;
+        this.api = api;
     }
 
     @Override
@@ -36,15 +37,28 @@ public class Bootstrap implements CommandLineRunner {
     }
 
     @Scheduled(fixedDelay = 60000)
-    @Transactional
     public void expire() {
-        List<Map<String, Object>> due = db.queryForList("SELECT id,slot_id FROM appointment WHERE status='PENDING_PAYMENT' AND pay_expires_at<=UTC_TIMESTAMP(3) ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED");
-        for (Map<String, Object> a : due) {
-            long id = ((Number) a.get("id")).longValue();
-            if (db.update("UPDATE appointment SET status='EXPIRED' WHERE id=? AND status='PENDING_PAYMENT'", id) == 1) {
-                db.update("UPDATE schedule_slot SET remaining=remaining+1 WHERE id=?", a.get("slot_id"));
-                db.update("UPDATE bill SET status='CLOSED' WHERE appointment_id=? AND type='REGISTRATION' AND status='UNPAID'", id);
-                db.update("INSERT INTO appointment_status_log(appointment_id,event_type,from_status,to_status) VALUES(?,'EXPIRE','PENDING_PAYMENT','EXPIRED')", id);
+        for (long appointmentId : db.queryForList("""
+                SELECT id FROM appointment WHERE status='PENDING_PAYMENT' AND pay_expires_at<=UTC_TIMESTAMP(3)
+                ORDER BY pay_expires_at,id LIMIT 100
+                """, Long.class)) {
+            api.expireAppointment(appointmentId);
+        }
+    }
+
+    @Scheduled(fixedDelayString = "${booking.disruption-scan-delay-ms:5000}")
+    public void scanDisruptions() {
+        for (long appointmentId : db.queryForList("""
+                SELECT a.id FROM schedule s JOIN schedule_slot sl ON sl.schedule_id=s.id
+                JOIN appointment a ON a.slot_id=sl.id
+                LEFT JOIN appointment_disruption d ON d.appointment_id=a.id AND d.suspended_schedule_id=s.id
+                WHERE s.status='SUSPENDED' AND a.status IN ('PENDING_PAYMENT','BOOKED') AND d.id IS NULL
+                ORDER BY a.id LIMIT 100
+                """, Long.class)) {
+            try {
+                api.processDisruption(appointmentId);
+            } catch (RuntimeException ex) {
+                log.warn("Unable to process disruption for appointment {}", appointmentId, ex);
             }
         }
     }
